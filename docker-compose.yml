@@ -1,0 +1,70 @@
+services:
+  database:
+    image: postgres:15-alpine
+    restart: always
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - database-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: minio/minio
+    restart: always
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio-data:/data
+
+  backend:
+    image: ghcr.io/facultaddeingenieria/atenti-backend:latest
+    restart: always
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+    expose:
+      - "8080"
+    depends_on:
+      database:
+        condition: service_healthy
+      minio:
+        condition: service_started
+
+  frontend:
+    image: ghcr.io/facultaddeingenieria/atenti-frontend:latest
+    restart: always
+    expose:
+      - "3000"
+
+  nginx:
+    image: nginx:latest
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d
+      - ./certbot/www:/var/www/certbot
+      - ./certbot/conf:/etc/letsencrypt
+    depends_on:
+      - frontend
+      - backend
+
+  certbot:
+    image: certbot/certbot
+    volumes:
+      - ./certbot/www:/var/www/certbot
+      - ./certbot/conf:/etc/letsencrypt
+
+volumes:
+  database-data:
+  minio-data:
