@@ -22,8 +22,11 @@ echo "$GHCR_PAT" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
 echo "Pulling latest images..."
 docker-compose -f docker-compose.prod.yml pull
 
+echo "Stopping existing containers..."
+docker-compose -f docker-compose.prod.yml down --remove-orphans
+
 echo "Starting containers..."
-docker-compose -f docker-compose.prod.yml up -d --remove-orphans
+docker-compose -f docker-compose.prod.yml up -d
 
 echo "Cleaning unused images..."
 docker image prune -f
