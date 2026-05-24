@@ -42,8 +42,11 @@ services:
   frontend:
     image: ghcr.io/facultaddeingenieria/atenti-frontend:latest
     restart: always
+    environment:
+      API_BASE_URL: https://atenzia.duckdns.org/api
     expose:
       - "3000"
+
 
   nginx:
     image: nginx:latest
