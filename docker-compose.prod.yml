@@ -61,12 +61,33 @@ services:
     depends_on:
       - frontend
       - backend
+    # Recarga cada 6h para tomar el certificado que renueva certbot-renew.
+    # nginx lee los certs una sola vez al arrancar: sin este reload seguiría
+    # sirviendo el viejo hasta el próximo restart.
+    command: >
+      /bin/sh -c "while :; do sleep 6h & wait $${!}; nginx -s reload; done & nginx -g 'daemon off;'"
 
+  # Invocación puntual: emitir el certificado inicial (init-letsencrypt.sh) o
+  # forzar una renovación (renew-cert.sh). No corre solo.
   certbot:
     image: certbot/certbot
     volumes:
       - ./certbot/www:/var/www/certbot
       - ./certbot/conf:/etc/letsencrypt
+
+  # Renovación desatendida. Intenta cada 12h; certbot no hace nada hasta que
+  # falten 30 días para el vencimiento, así que es barato repetirlo.
+  # Está separado de 'certbot' a propósito: si el loop fuera el entrypoint de
+  # ese servicio, los `docker compose run --rm certbot certonly ...` de los
+  # scripts caerían adentro del loop en vez de emitir el certificado.
+  certbot-renew:
+    image: certbot/certbot
+    restart: always
+    volumes:
+      - ./certbot/www:/var/www/certbot
+      - ./certbot/conf:/etc/letsencrypt
+    entrypoint: >
+      /bin/sh -c "trap exit TERM; while :; do certbot renew --webroot --webroot-path=/var/www/certbot; sleep 12h & wait $${!}; done"
 
 volumes:
   database-data:

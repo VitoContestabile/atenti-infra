@@ -5,6 +5,28 @@ Cómo levantar este stack en una VM limpia de AWS, de cero.
 Escrito el 2026-09-20 al migrar de la VM vieja (`ip-172-31-47-253`, 911 MB RAM)
 a la nueva (`ip-172-31-34-125`, Ubuntu 26.04 "resolute", 3.7 GB RAM).
 
+## Resumen
+
+Con la VM ya provista (disco de 20 GB, Docker instalado, puertos 80/443 abiertos
+y el DNS apuntando a la IP), levantar el stack son tres pasos:
+
+```bash
+git clone https://github.com/VitoContestabile/atenti-infra.git ~/atenti-infra
+cd ~/atenti-infra
+cp /ruta/a/tu/.env .              # el único archivo que no está en git
+./scripts/init-letsencrypt.sh     # certificado (idempotente)
+./scripts/deploy.sh               # migra la base y levanta todo
+```
+
+Opcional, sólo para tener datos con los que entrar:
+
+```bash
+docker compose -f docker-compose.prod.yml exec -T backend node dist/prisma/seed.js
+```
+
+La renovación del certificado es automática (vive en el compose, sección 9).
+El resto del documento explica cada paso y las trampas de cada uno.
+
 ---
 
 ## 0. Requisitos de la VM
@@ -143,41 +165,30 @@ Las dos tienen que coincidir.
 
 ## 6. Certificado (primera vez)
 
-**Huevo y gallina:** `nginx/conf.d/app-https.conf` apunta a certificados que
-todavía no existen, así que nginx no arranca y certbot no puede validar.
-
-Por eso el repo tiene **`nginx/bootstrap/app-http.conf`**: una config HTTP-only
-que sirve sólo el `/.well-known/acme-challenge/`.
-
 ```bash
 cd ~/atenti-infra
-mkdir -p certbot/www certbot/conf
-
-# 1. dejar SOLO la config http en conf.d
-mv nginx/conf.d/app-https.conf /tmp/app-https.conf.hold
-cp nginx/bootstrap/app-http.conf nginx/conf.d/
-
-# 2. login a GHCR (nginx arrastra frontend/backend por depends_on)
-set -a; source .env; set +a
-echo "$GHCR_PAT" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
-
-# 3. levantar solo nginx
-docker compose -f docker-compose.prod.yml up -d --no-deps nginx
-curl -s http://127.0.0.1/          # debe responder "HTTP OK"
-
-# 4. emitir el certificado
 ./scripts/init-letsencrypt.sh
-
-# 5. restaurar la config https y sacar la de bootstrap
-rm nginx/conf.d/app-http.conf
-mv /tmp/app-https.conf.hold nginx/conf.d/app-https.conf
-docker compose -f docker-compose.prod.yml restart nginx
 ```
 
-> **Nunca dejar los dos `.conf` juntos en `conf.d/`.** Los dos declaran un
+El script se encarga de todo el huevo-y-gallina: `nginx/conf.d/app-https.conf`
+apunta a certificados que todavía no existen, así que nginx no arranca y certbot
+no puede validar por webroot. Entonces el script deja temporalmente sólo la
+config HTTP de `nginx/bootstrap/`, levanta nginx, espera a que responda en el 80,
+pide el certificado y restaura la config HTTPS. Si algo falla en el medio, un
+`trap` restaura `conf.d/` igual.
+
+Es **idempotente**: si el certificado ya existe no hace nada. Para reemitirlo,
+`./scripts/init-letsencrypt.sh --force`.
+
+Al terminar deja nginx **parado** a propósito: con la config HTTPS puesta, nginx
+no arranca hasta que existan `frontend` y `backend` (ver la nota de la sección 7).
+Lo levanta `deploy.sh`.
+
+> **Nunca poner los dos `.conf` juntos en `conf.d/`.** Los dos declaran un
 > `server` en el puerto 80 con el mismo `server_name`: nginx carga el primero
 > alfabéticamente (`app-http.conf`), el redirect a HTTPS nunca ocurre y el sitio
-> responde `HTTP OK` en texto plano.
+> responde `HTTP OK` en texto plano. Por eso el de bootstrap vive fuera de
+> `conf.d/` y el script lo copia y lo borra.
 
 Certificado actual: emitido 2026-09-20, **vence 2026-12-19**.
 
@@ -189,17 +200,29 @@ Certificado actual: emitido 2026-09-20, **vence 2026-12-19**.
 cd ~/atenti-infra && ./scripts/deploy.sh
 ```
 
-Hace login a GHCR, `pull`, `down --remove-orphans`, `up -d` y `docker image prune -f`.
+En orden: login a GHCR, `pull`, `down --remove-orphans`, levanta **sólo la base**
+y espera a que esté *healthy*, corre **`prisma migrate deploy`**, recién ahí
+levanta el resto del stack, y al final `docker image prune -f`.
 
 Verificar:
 
 ```bash
 docker compose -f docker-compose.prod.yml ps
-curl -sI https://atenzia.duckdns.org/          # 200 desde el frontend
-curl -sI https://atenzia.duckdns.org/backend/  # backend vía proxy
+curl -sI https://atenzia.duckdns.org/                       # 200, frontend
+curl -s  https://atenzia.duckdns.org/backend/notifications  # 200, API
 ```
 
-`certbot` aparece como `Exited` — es normal, corre sólo cuando se lo invoca.
+Estado esperado de los contenedores:
+
+| Servicio | Estado |
+|---|---|
+| `database` | Up (healthy) |
+| `backend`, `frontend`, `minio`, `nginx` | Up |
+| `certbot-renew` | **Up** — es el loop de renovación |
+| `certbot` | `Exited (1)` — **normal**, sólo corre cuando se lo invoca |
+
+`/backend/` a secas devuelve `404`: el backend no tiene ruta raíz. No es el proxy;
+para probar el proxy usar una ruta real como `/backend/notifications`.
 
 > **nginx no arranca si falta el frontend o el backend.** nginx resuelve los
 > upstreams de `proxy_pass` al iniciar; si `frontend` no está levantado falla con
@@ -210,35 +233,29 @@ curl -sI https://atenzia.duckdns.org/backend/  # backend vía proxy
 
 ---
 
-## 8. Migraciones de la base (¡obligatorio en una VM nueva!)
+## 8. Datos iniciales (seed)
 
-**El backend NO corre las migraciones al arrancar.** Con la base vacía levanta
-igual —Nest mapea todas las rutas y parece sano— pero cualquier request muere
-con `500` y en los logs aparece `PrismaClientKnownRequestError`, además de los
-jobs programados fallando cada minuto (`Medication delay detection failed`, etc.).
+**Las migraciones ya no son un paso manual**: `deploy.sh` levanta la base, espera
+a que esté *healthy* y corre `prisma migrate deploy` **antes** de arrancar el
+backend. Es idempotente — si no hay migraciones pendientes no hace nada.
 
-La imagen del backend trae `prisma/migrations` (57 migraciones) y el CLI:
+El orden importa: si el backend arranca contra una base sin migrar, levanta
+igual —Nest mapea todas las rutas y parece sano— pero cada request muere con
+`500` / `PrismaClientKnownRequestError` y los jobs programados fallan cada
+minuto. Por eso se migra antes y no en paralelo.
 
-```bash
-cd ~/atenti-infra
-docker compose -f docker-compose.prod.yml exec -T backend npx prisma migrate deploy
-docker compose -f docker-compose.prod.yml restart backend
-```
-
-Verificar que el esquema quedó creado (deben ser ~68 tablas):
+Verificar (deben ser ~68 tablas):
 
 ```bash
 docker compose -f docker-compose.prod.yml exec -T database \
   psql -U postgres -d app -c "select count(*) from information_schema.tables where table_schema='public'"
 ```
 
-Prisma toma `DATABASE_URL` del `.env` (no `DOCKER_DATABASE_URL`); las dos apuntan
-a `database:5432`, así que funciona desde adentro del contenedor.
+### Seed (manual, sólo datos de prueba)
 
-### Datos iniciales
-
-Sin seed la base queda vacía: el esquema está pero no hay usuarios, así que no
-se puede iniciar sesión.
+El seed **no** corre en el deploy: son datos de prueba, no algo que quieras
+recrear en cada release. Sin él la base queda con el esquema pero sin usuarios,
+así que no se puede iniciar sesión.
 
 **`npx prisma db seed` NO funciona** en la imagen de producción: el comando
 configurado es `tsx prisma/seed.ts` y `tsx` es una devDependency que no está
@@ -270,26 +287,34 @@ Las contraseñas están en `prisma/seed.ts` del repo del backend. Los avisos
 
 ## 9. Renovación automática del certificado
 
+**No hay que configurar nada**: la renovación vive en el `docker-compose.prod.yml`
+y arranca con el stack. No depende de un cron de la VM (que había que acordarse
+de crear, y que fallaba en silencio si el script tenía un problema).
+
+- **`certbot-renew`** — `restart: always`, corre `certbot renew` cada 12 h.
+  Certbot no hace nada hasta que falten 30 días para el vencimiento, así que
+  repetirlo es barato. Debe aparecer como **`Up`**, no `Exited`.
+- **`nginx`** — recarga cada 6 h. Hace falta porque nginx lee los certificados
+  una sola vez al arrancar: sin ese reload seguiría sirviendo el viejo.
+
+Verificar que está andando:
+
 ```bash
-crontab -e
+docker compose -f docker-compose.prod.yml ps certbot-renew      # -> Up
+docker compose -f docker-compose.prod.yml logs certbot-renew    # -> "Certificate not yet due for renewal"
 ```
 
-```cron
-0 3 * * 1 /home/ubuntu/atenti-infra/scripts/renew-cert.sh >> /home/ubuntu/renew-cert.log 2>&1
-```
+El servicio **`certbot`** (sin `-renew`) es otra cosa: no corre solo, es el que
+usan los scripts para invocaciones puntuales. Están separados a propósito — si el
+loop fuera el entrypoint de `certbot`, los `docker compose run --rm certbot
+certonly ...` de `init-letsencrypt.sh` caerían adentro del loop en vez de emitir
+el certificado.
 
-Lunes a las 3 AM. El script se ubica solo (calcula su propio directorio), así que
-no hace falta `cd` en el cron.
-
-Probarlo sin esperar al lunes, desde otro directorio para simular el cron:
+Para forzar una renovación a mano:
 
 ```bash
-cd /tmp && /home/ubuntu/atenti-infra/scripts/renew-cert.sh
+./scripts/renew-cert.sh
 ```
-
-Debe decir `Certificate not yet due for renewal` y reiniciar nginx. Si dice
-`no configuration file provided: not found`, el script perdió el
-`-f docker-compose.prod.yml` (ver los cambios abajo).
 
 ---
 
@@ -313,6 +338,14 @@ Debe decir `Certificate not yet due for renewal` y reiniciar nginx. Si dice
    fallaba en silencio (a un log que nadie mira) y **el certificado hubiera
    expirado**. Ahora usa `-f` y hace `cd` a la raíz del repo por su cuenta.
 8. **Disco de 20 GB**, ver sección 0.
+9. **`deploy.sh` corre las migraciones de Prisma** antes de arrancar el backend.
+   Era el paso manual más fácil de olvidarse, porque no falla ruidosamente: el
+   backend levanta "sano" y todo responde 500.
+10. **`init-letsencrypt.sh` hace solo el swap de configs de nginx** y es
+    idempotente. Antes eran cinco pasos manuales de mover archivos.
+11. **Renovación automática en el compose** (`certbot-renew` + reload de nginx),
+    en vez de un cron en la VM. Viaja con el repo: una VM nueva la tiene sin que
+    nadie configure nada.
 
 ## Pendiente / a revisar
 
