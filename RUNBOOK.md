@@ -100,11 +100,12 @@ echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
 ```bash
 git clone https://github.com/VitoContestabile/atenti-infra.git ~/atenti-infra
 cd ~/atenti-infra
-chmod +x scripts/*.sh          # el bit de ejecución no viaja en el clone
+# Los scripts ya vienen ejecutables (git guarda el modo 100755).
+# Si por algún motivo no lo están: chmod +x scripts/*.sh
 ```
 
-Copiar a mano el **`.env` real** (no está en git, ver `.env.example` por la
-estructura). Contiene:
+Copiar a mano el **`.env` real** (no está en git). `.env.example` tiene las 26
+claves que hacen falta, en el mismo orden, con notas de formato. Contiene:
 
 - `POSTGRES_*`, `MINIO_*` — credenciales de la base y el storage
 - `GHCR_USER` / `GHCR_PAT` — token de GitHub para bajar las imágenes privadas
