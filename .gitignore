@@ -1,0 +1,8 @@
+# Secretos reales — NUNCA commitear (contiene GHCR_PAT y AUTH_PQ_PRIVATE_KEY)
+.env
+
+# Certificados Let's Encrypt y webroot del challenge
+certbot/
+
+# IDE
+.idea/

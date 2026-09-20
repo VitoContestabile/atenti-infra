@@ -1,0 +1,340 @@
+# Runbook — Deploy de Atenti
+
+Cómo levantar este stack en una VM limpia de AWS, de cero.
+
+Escrito el 2026-09-20 al migrar de la VM vieja (`ip-172-31-47-253`, 911 MB RAM)
+a la nueva (`ip-172-31-34-125`, Ubuntu 26.04 "resolute", 3.7 GB RAM).
+
+---
+
+## 0. Requisitos de la VM
+
+| Recurso | Mínimo real | Por qué |
+|---|---|---|
+| RAM | 2 GB | Con 911 MB (VM vieja) el stack no entraba. 3.7 GB va holgado. |
+| **Disco** | **20 GB** | **8 GB NO alcanza.** Ver el desglose abajo. Esta VM corre con 20 GB: usa 8.8 GB, libres 9.5 GB. |
+| Puertos | 80, 443 abiertos en el security group | Certbot valida por HTTP en el 80. |
+
+### Por qué 20 GB y no 8
+
+Tamaño real en disco de las imágenes del stack:
+
+| Imagen | En disco |
+|---|---|
+| `postgres:15-alpine` | 417 MB |
+| `certbot/certbot` | 293 MB |
+| `nginx:latest` | 242 MB |
+| `quay.io/minio/minio` | 241 MB |
+| `atenti-backend` | ~700 MB (273 MB comprimido) |
+| `atenti-frontend` | ~1.1 GB (440 MB comprimido) |
+| **Total imágenes** | **~3 GB** |
+
+Más el SO (~4.5 GB), el swap (1 GB), los volúmenes de datos y el espacio
+temporal que Docker necesita durante la extracción de cada capa.
+
+Con un EBS de 8 GB el deploy **falla** con
+`no space left on device` al extraer las capas del backend/frontend.
+
+---
+
+## 1. Expandir el disco (si el EBS es menor a 20 GB)
+
+En la consola de AWS: **EC2 → Volumes → seleccionar el volumen → Actions →
+Modify volume → Size = 20 GB**. Después, en la VM:
+
+```bash
+sudo growpart /dev/nvme0n1 1     # expande la partición
+sudo resize2fs /dev/nvme0n1p1    # expande el filesystem
+df -h /                          # verificar
+```
+
+La instancia no necesita reiniciarse.
+
+---
+
+## 2. Docker
+
+Los paquetes de `apt` dan versiones viejas. Usar el repositorio oficial de Docker.
+Reemplazar `resolute` por el codename de la distro (`. /etc/os-release; echo $VERSION_CODENAME`).
+
+```bash
+sudo install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+sudo chmod a+r /etc/apt/keyrings/docker.gpg
+echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu resolute stable" \
+  | sudo tee /etc/apt/sources.list.d/docker.list
+sudo apt-get update
+sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+sudo usermod -aG docker ubuntu
+sudo systemctl enable --now docker
+```
+
+El grupo `docker` recién aplica al volver a loguearse. Para usarlo en la misma
+sesión: `newgrp docker` (o prefijar los comandos con `sg docker -c "..."`).
+
+Versiones instaladas en esta VM: Docker **29.8.1**, Compose **v5.5.1**.
+
+> El binario manual en `~/.docker/cli-plugins/` de la VM vieja **ya no hace falta**:
+> el plugin viene con `docker-compose-plugin`.
+
+---
+
+## 3. Swap
+
+La VM viene sin swap. 2 GB con un disco de 20 GB (con el EBS de 8 GB había que
+bajarlo a 1 GB porque el swapfile sale del mismo disco).
+
+```bash
+sudo fallocate -l 2G /swapfile
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+```
+
+---
+
+## 4. Repo y secretos
+
+```bash
+git clone https://github.com/VitoContestabile/atenti-infra.git ~/atenti-infra
+cd ~/atenti-infra
+chmod +x scripts/*.sh          # el bit de ejecución no viaja en el clone
+```
+
+Copiar a mano el **`.env` real** (no está en git, ver `.env.example` por la
+estructura). Contiene:
+
+- `POSTGRES_*`, `MINIO_*` — credenciales de la base y el storage
+- `GHCR_USER` / `GHCR_PAT` — token de GitHub para bajar las imágenes privadas
+- `AUTH_PQ_PRIVATE_KEY` / `AUTH_PQ_PUBLIC_KEY` — claves de firma de tokens
+- `DOMAIN_NAME=atenzia.duckdns.org`, `CERTBOT_EMAIL`
+- `MAIL_*`, `AUTH_TOKEN_TTL`
+
+> **Trampa:** los valores con `<`, `>`, espacios o `#` tienen que ir **entre
+> comillas dobles**. `deploy.sh` hace `source .env` con `set -e`, y un
+> `MAIL_FROM=Atenzia <no-reply@atenzia.local>` sin comillas es una redirección
+> de bash: rompe el script entero. Correcto:
+> `MAIL_FROM="Atenzia <no-reply@atenzia.local>"`
+>
+> Verificar siempre con: `( set -a; source .env; set +a; echo ok )`
+
+`.gitignore` ignora `.env`, `certbot/` y `.idea/`. **No commitear el `.env`:**
+tiene el PAT y la clave privada.
+
+---
+
+## 5. DNS
+
+Apuntar `atenzia.duckdns.org` a la IP pública de la VM nueva en
+[duckdns.org](https://duckdns.org). Verificar antes de pedir el certificado
+(si el DNS apunta a otro lado, certbot falla):
+
+```bash
+getent hosts atenzia.duckdns.org
+curl -s http://169.254.169.254/latest/meta-data/public-ipv4   # IP de esta VM
+```
+
+Las dos tienen que coincidir.
+
+---
+
+## 6. Certificado (primera vez)
+
+**Huevo y gallina:** `nginx/conf.d/app-https.conf` apunta a certificados que
+todavía no existen, así que nginx no arranca y certbot no puede validar.
+
+Por eso el repo tiene **`nginx/bootstrap/app-http.conf`**: una config HTTP-only
+que sirve sólo el `/.well-known/acme-challenge/`.
+
+```bash
+cd ~/atenti-infra
+mkdir -p certbot/www certbot/conf
+
+# 1. dejar SOLO la config http en conf.d
+mv nginx/conf.d/app-https.conf /tmp/app-https.conf.hold
+cp nginx/bootstrap/app-http.conf nginx/conf.d/
+
+# 2. login a GHCR (nginx arrastra frontend/backend por depends_on)
+set -a; source .env; set +a
+echo "$GHCR_PAT" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+
+# 3. levantar solo nginx
+docker compose -f docker-compose.prod.yml up -d --no-deps nginx
+curl -s http://127.0.0.1/          # debe responder "HTTP OK"
+
+# 4. emitir el certificado
+./scripts/init-letsencrypt.sh
+
+# 5. restaurar la config https y sacar la de bootstrap
+rm nginx/conf.d/app-http.conf
+mv /tmp/app-https.conf.hold nginx/conf.d/app-https.conf
+docker compose -f docker-compose.prod.yml restart nginx
+```
+
+> **Nunca dejar los dos `.conf` juntos en `conf.d/`.** Los dos declaran un
+> `server` en el puerto 80 con el mismo `server_name`: nginx carga el primero
+> alfabéticamente (`app-http.conf`), el redirect a HTTPS nunca ocurre y el sitio
+> responde `HTTP OK` en texto plano.
+
+Certificado actual: emitido 2026-09-20, **vence 2026-12-19**.
+
+---
+
+## 7. Deploy
+
+```bash
+cd ~/atenti-infra && ./scripts/deploy.sh
+```
+
+Hace login a GHCR, `pull`, `down --remove-orphans`, `up -d` y `docker image prune -f`.
+
+Verificar:
+
+```bash
+docker compose -f docker-compose.prod.yml ps
+curl -sI https://atenzia.duckdns.org/          # 200 desde el frontend
+curl -sI https://atenzia.duckdns.org/backend/  # backend vía proxy
+```
+
+`certbot` aparece como `Exited` — es normal, corre sólo cuando se lo invoca.
+
+> **nginx no arranca si falta el frontend o el backend.** nginx resuelve los
+> upstreams de `proxy_pass` al iniciar; si `frontend` no está levantado falla con
+> `[emerg] host not found in upstream "frontend"` y queda en crash loop.
+> Por eso hay que levantar el stack completo con `deploy.sh`, no servicio por
+> servicio. Si nginx quedó reiniciándose, levantar frontend y backend y después
+> `docker compose -f docker-compose.prod.yml restart nginx`.
+
+---
+
+## 8. Migraciones de la base (¡obligatorio en una VM nueva!)
+
+**El backend NO corre las migraciones al arrancar.** Con la base vacía levanta
+igual —Nest mapea todas las rutas y parece sano— pero cualquier request muere
+con `500` y en los logs aparece `PrismaClientKnownRequestError`, además de los
+jobs programados fallando cada minuto (`Medication delay detection failed`, etc.).
+
+La imagen del backend trae `prisma/migrations` (57 migraciones) y el CLI:
+
+```bash
+cd ~/atenti-infra
+docker compose -f docker-compose.prod.yml exec -T backend npx prisma migrate deploy
+docker compose -f docker-compose.prod.yml restart backend
+```
+
+Verificar que el esquema quedó creado (deben ser ~68 tablas):
+
+```bash
+docker compose -f docker-compose.prod.yml exec -T database \
+  psql -U postgres -d app -c "select count(*) from information_schema.tables where table_schema='public'"
+```
+
+Prisma toma `DATABASE_URL` del `.env` (no `DOCKER_DATABASE_URL`); las dos apuntan
+a `database:5432`, así que funciona desde adentro del contenedor.
+
+### Datos iniciales
+
+Sin seed la base queda vacía: el esquema está pero no hay usuarios, así que no
+se puede iniciar sesión.
+
+**`npx prisma db seed` NO funciona** en la imagen de producción: el comando
+configurado es `tsx prisma/seed.ts` y `tsx` es una devDependency que no está
+instalada (`spawn tsx ENOENT`). Instalar `tsx` al vuelo con `npx -y tsx` tampoco
+alcanza: `prisma/seed.ts` importa 7 módulos de `../src/`, y la imagen de
+producción sólo trae `dist/`.
+
+El seed **ya viene compilado**. Correr directamente:
+
+```bash
+docker compose -f docker-compose.prod.yml exec -T backend node dist/prisma/seed.js
+```
+
+Termina con `Seed operativo ejecutado correctamente`. Deja 1 institución,
+4 pacientes y 4 usuarios de prueba:
+
+| Email | Rol |
+|---|---|
+| `sofia.admin@atenti.test` | ADMIN |
+| `carla.medica@atenti.test` | DOCTOR |
+| `ana.enfermera@atenti.test` | NURSE |
+| `juan.enfermero@atenti.test` | NURSE |
+
+Las contraseñas están en `prisma/seed.ts` del repo del backend. Los avisos
+`Sin imagen para ...` durante el seed son normales (faltan los archivos en
+`seed-images/`, no rompen nada).
+
+---
+
+## 9. Renovación automática del certificado
+
+```bash
+crontab -e
+```
+
+```cron
+0 3 * * 1 /home/ubuntu/atenti-infra/scripts/renew-cert.sh >> /home/ubuntu/renew-cert.log 2>&1
+```
+
+Lunes a las 3 AM. El script se ubica solo (calcula su propio directorio), así que
+no hace falta `cd` en el cron.
+
+Probarlo sin esperar al lunes, desde otro directorio para simular el cron:
+
+```bash
+cd /tmp && /home/ubuntu/atenti-infra/scripts/renew-cert.sh
+```
+
+Debe decir `Certificate not yet due for renewal` y reiniciar nginx. Si dice
+`no configuration file provided: not found`, el script perdió el
+`-f docker-compose.prod.yml` (ver los cambios abajo).
+
+---
+
+## Cambios respecto de la VM vieja
+
+1. **`minio/minio` → `quay.io/minio/minio`.** El repo `minio/minio` **ya no
+   existe en Docker Hub** (la API devuelve `object not found`). En la VM vieja
+   andaba porque la imagen estaba cacheada localmente; en una VM limpia el pull
+   falla con `pull access denied`. El registry oficial de MinIO es quay.io.
+2. **`MAIL_FROM` entre comillas** en el `.env` — ver sección 4.
+3. **`app-http.conf` movido a `nginx/bootstrap/`** — ver sección 6.
+4. **`.gitignore`** — estaba vacío, ahora protege `.env`, `certbot/` y `.idea/`.
+5. **Compose oficial vía apt**, no el binario manual en `~/.docker/cli-plugins/`.
+   Ojo: el `~/.docker/config.json` de la VM vieja no se migra — hay que rehacer
+   el `docker login ghcr.io` (lo hace `deploy.sh` solo).
+6. **nginx del sistema**: en Ubuntu 26.04 no viene instalado, no hay nada que
+   deshabilitar. Si estuviera: `sudo systemctl disable --now nginx`.
+7. **`renew-cert.sh` arreglado.** Corría `docker compose` **sin** `-f
+   docker-compose.prod.yml`, y como el archivo no se llama `docker-compose.yml`
+   fallaba con `no configuration file provided: not found`. Desde el cron eso
+   fallaba en silencio (a un log que nadie mira) y **el certificado hubiera
+   expirado**. Ahora usa `-f` y hace `cd` a la raíz del repo por su cuenta.
+8. **Disco de 20 GB**, ver sección 0.
+
+## Pendiente / a revisar
+
+- `BACKEND_URL=https://atenzia.duckdns.org/api` en el `.env`, pero nginx proxea
+  `/backend/` y el frontend usa `NEXT_PUBLIC_API_BASE_URL=.../backend`. La ruta
+  `/api` no existe en la config de nginx. Revisar para qué usa el backend esa
+  variable — puede ser un link roto en los mails.
+- `MAIL_HOST=localhost` / `MAIL_PORT=1025` apunta a un mailhog que no está en el
+  compose. Con `MAIL_ENABLED=true` el envío de mails va a fallar.
+- Las imágenes usan tag `latest`. Para que el deploy sea reproducible convendría
+  pinear versiones.
+
+## Datos
+
+Esta VM arrancó **limpia** (sin migrar datos de la vieja). Para migrar
+`database-data` y `minio-data` en el futuro:
+
+```bash
+# en la VM origen
+docker run --rm -v atenti-infra_database-data:/v -v $PWD:/b alpine tar czf /b/db.tgz -C /v .
+docker run --rm -v atenti-infra_minio-data:/v -v $PWD:/b alpine tar czf /b/minio.tgz -C /v .
+# copiar por scp, y en la VM destino (con el stack parado)
+docker run --rm -v atenti-infra_database-data:/v -v $PWD:/b alpine tar xzf /b/db.tgz -C /v
+```
+
+Para la base, un `pg_dump` es más portable que copiar el volumen crudo.
